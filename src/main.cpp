@@ -8,11 +8,13 @@
 #include <vector>
 
 namespace {
+// Represents one fixation: where the user stared (in pixels) and how long the stare lasted.
 struct GazeSample {
     cv::Point2f position;
     double durationSeconds;
 };
 
+// Create synthetic fixation data so the demo can run without hardware.
 std::vector<GazeSample> generateDemoSamples(int width, int height, int count = 20) {
     std::mt19937 rng(static_cast<unsigned int>(
         std::chrono::high_resolution_clock::now().time_since_epoch().count()));
@@ -28,6 +30,8 @@ std::vector<GazeSample> generateDemoSamples(int width, int height, int count = 2
     return samples;
 }
 
+// Map a pixel location to one of four Areas of Interest (AOI1..AOI4) using the screen center
+// as the origin and walking clockwise from the top-left quadrant.
 int regionIndexForPoint(const cv::Point2f &p, int width, int height) {
     const float centerX = static_cast<float>(width) / 2.0f;
     const float centerY = static_cast<float>(height) / 2.0f;
@@ -41,6 +45,7 @@ int regionIndexForPoint(const cv::Point2f &p, int width, int height) {
     return 3;                         // AOI4
 }
 
+// Draw the background grid, axis, and quadrant labels once so frames can reuse it.
 cv::Mat makeBaseCanvas(int width, int height) {
     cv::Mat canvas(height, width, CV_8UC3, cv::Scalar(20, 20, 20));
     const cv::Point center{width / 2, height / 2};
@@ -63,6 +68,7 @@ cv::Mat makeBaseCanvas(int width, int height) {
     return canvas;
 }
 
+// Pick a distinct color for each AOI to make circles and labels easy to match.
 cv::Scalar colorForAOI(int index) {
     switch (index) {
         case 0:
@@ -81,9 +87,11 @@ int main() {
     const int width = 1280;
     const int height = 720;
 
+    // Generate a handful of fake fixations scattered across the screen.
     const auto samples = generateDemoSamples(width, height);
     std::array<double, 4> dwellSeconds{0.0, 0.0, 0.0, 0.0};
 
+    // Base background reused for every frame keeps drawing work minimal.
     const cv::Mat baseCanvas = makeBaseCanvas(width, height);
     std::vector<cv::Point2f> pointsDrawn;
 
@@ -97,6 +105,8 @@ int main() {
         const int region = regionIndexForPoint(sample.position, width, height);
         dwellSeconds[static_cast<std::size_t>(region)] += sample.durationSeconds;
 
+        // Draw every fixation seen so far; current sample controls the radius scale for all
+        // circles so longer gazes appear larger.
         const double radius = 12.0 + sample.durationSeconds * 55.0;  // Larger when staring longer.
         for (std::size_t i = 0; i < pointsDrawn.size(); ++i) {
             const auto r = regionIndexForPoint(pointsDrawn[i], width, height);
@@ -109,6 +119,7 @@ int main() {
             return dwellSeconds[static_cast<std::size_t>(idx)] / totalObserved * 100.0;
         };
 
+        // Overlay AOI percentages and durations so the viewer sees live dwell stats.
         const int textYStart = height - 80;
         const double fontScale = 0.75;
         const int thickness = 2;
