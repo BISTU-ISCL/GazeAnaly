@@ -1,103 +1,158 @@
 #include <opencv2/opencv.hpp>
-#include <random>
+
+#include <array>
 #include <chrono>
+#include <iostream>
+#include <random>
 #include <string>
 #include <vector>
-#include <iostream>
 
 namespace {
-struct GazePoint {
+// Represents one fixation: where the user stared (in pixels) and how long the stare lasted.
+struct GazeSample {
     cv::Point2f position;
+    double durationSeconds;
 };
 
-std::vector<GazePoint> generateDemoGazePoints(int width, int height, int count = 3) {
-    static std::mt19937 rng(static_cast<unsigned int>(
+// Create synthetic fixation data so the demo can run without hardware.
+std::vector<GazeSample> generateDemoSamples(int width, int height, int count = 20) {
+    std::mt19937 rng(static_cast<unsigned int>(
         std::chrono::high_resolution_clock::now().time_since_epoch().count()));
-    std::uniform_real_distribution<float> distX(0.0f, static_cast<float>(width - 1));
-    std::uniform_real_distribution<float> distY(0.0f, static_cast<float>(height - 1));
+    std::uniform_real_distribution<float> distX(0.0f, static_cast<float>(width));
+    std::uniform_real_distribution<float> distY(0.0f, static_cast<float>(height));
+    std::uniform_real_distribution<double> distDuration(0.25, 1.5);
 
-    std::vector<GazePoint> points;
-    points.reserve(static_cast<std::size_t>(count));
+    std::vector<GazeSample> samples;
+    samples.reserve(static_cast<std::size_t>(count));
     for (int i = 0; i < count; ++i) {
-        points.push_back({cv::Point2f(distX(rng), distY(rng))});
+        samples.push_back({cv::Point2f(distX(rng), distY(rng)), distDuration(rng)});
     }
-    return points;
+    return samples;
 }
 
-void drawGazePoints(cv::Mat &heatmap, const std::vector<GazePoint> &points, float intensity = 1.0f, int radius = 40) {
-    for (const auto &p : points) {
-        cv::circle(heatmap, p.position, radius, cv::Scalar(intensity), -1, cv::LINE_AA);
-    }
+// Map a pixel location to one of four Areas of Interest (AOI1..AOI4) using the screen center
+// as the origin and walking clockwise from the top-left quadrant.
+int regionIndexForPoint(const cv::Point2f &p, int width, int height) {
+    const float centerX = static_cast<float>(width) / 2.0f;
+    const float centerY = static_cast<float>(height) / 2.0f;
+    const bool right = p.x >= centerX;
+    const bool bottom = p.y >= centerY;
+
+    // AOI naming matches quadrants starting at top-left and going clockwise.
+    if (!right && !bottom) return 0;  // AOI1
+    if (right && !bottom) return 1;   // AOI2
+    if (right && bottom) return 2;    // AOI3
+    return 3;                         // AOI4
 }
 
-cv::Mat renderHeatmapOverlay(const cv::Mat &frame, cv::Mat &heatmap) {
-    cv::Mat blurred;
-    cv::GaussianBlur(heatmap, blurred, cv::Size(0, 0), 25.0);
+// Draw the background grid, axis, and quadrant labels once so frames can reuse it.
+cv::Mat makeBaseCanvas(int width, int height) {
+    cv::Mat canvas(height, width, CV_8UC3, cv::Scalar(20, 20, 20));
+    const cv::Point center{width / 2, height / 2};
+    cv::line(canvas, {center.x, 0}, {center.x, height}, cv::Scalar(80, 80, 80), 1, cv::LINE_AA);
+    cv::line(canvas, {0, center.y}, {width, center.y}, cv::Scalar(80, 80, 80), 1, cv::LINE_AA);
 
-    cv::Mat normalized;
-    cv::normalize(blurred, normalized, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+    const std::array<std::string, 4> labels{"AOI1", "AOI2", "AOI3", "AOI4"};
+    const int padding = 12;
+    const double fontScale = 0.8;
+    const int thickness = 2;
+    cv::putText(canvas, labels[0], {padding, padding + 20}, cv::FONT_HERSHEY_SIMPLEX, fontScale,
+                {180, 180, 180}, thickness, cv::LINE_AA);
+    cv::putText(canvas, labels[1], {center.x + padding, padding + 20}, cv::FONT_HERSHEY_SIMPLEX,
+                fontScale, {180, 180, 180}, thickness, cv::LINE_AA);
+    cv::putText(canvas, labels[2], {center.x + padding, center.y + padding + 20},
+                cv::FONT_HERSHEY_SIMPLEX, fontScale, {180, 180, 180}, thickness, cv::LINE_AA);
+    cv::putText(canvas, labels[3], {padding, center.y + padding + 20}, cv::FONT_HERSHEY_SIMPLEX,
+                fontScale, {180, 180, 180}, thickness, cv::LINE_AA);
 
-    cv::Mat colored;
-    cv::applyColorMap(normalized, colored, cv::COLORMAP_JET);
-
-    cv::Mat overlay;
-    cv::addWeighted(frame, 0.6, colored, 0.4, 0.0, overlay);
-    return overlay;
+    return canvas;
 }
-} // namespace
 
-int main(int argc, char **argv) {
-    std::string source = "0";
-    if (argc > 1) {
-        source = argv[1];
+// Pick a distinct color for each AOI to make circles and labels easy to match.
+cv::Scalar colorForAOI(int index) {
+    switch (index) {
+        case 0:
+            return {0, 128, 255};  // Orange
+        case 1:
+            return {0, 255, 0};    // Green
+        case 2:
+            return {255, 0, 0};    // Blue
+        default:
+            return {255, 255, 0};  // Cyan-ish
     }
+}
+}
 
-    cv::VideoCapture cap;
-    if (source == "0") {
-        cap.open(0);
-    } else {
-        cap.open(source);
-    }
+int main() {
+    const int width = 1280;
+    const int height = 720;
 
-    if (!cap.isOpened()) {
-        std::cerr << "Failed to open video source. Use camera (default) or pass a video path." << std::endl;
-        return 1;
-    }
+    // Generate a handful of fake fixations scattered across the screen.
+    const auto samples = generateDemoSamples(width, height);
+    std::array<double, 4> dwellSeconds{0.0, 0.0, 0.0, 0.0};
 
-    cv::Mat frame;
-    if (!cap.read(frame)) {
-        std::cerr << "Unable to read initial frame." << std::endl;
-        return 1;
-    }
+    // Base background reused for every frame keeps drawing work minimal.
+    const cv::Mat baseCanvas = makeBaseCanvas(width, height);
+    std::vector<cv::Point2f> pointsDrawn;
 
-    cv::Mat heatmap = cv::Mat::zeros(frame.rows, frame.cols, CV_32FC1);
+    std::cout << "Demo: synthetic gaze samples across four AOIs (center as origin)." << std::endl;
+    std::cout << "Each circle radius reflects how long the participant stared at that location." << std::endl;
 
-    std::cout << "Press 'q' to quit. Demo gaze points are randomly generated." << std::endl;
+    for (const auto &sample : samples) {
+        cv::Mat frame = baseCanvas.clone();
+        pointsDrawn.push_back(sample.position);
 
-    while (true) {
-        if (!cap.read(frame) || frame.empty()) {
-            break;
+        const int region = regionIndexForPoint(sample.position, width, height);
+        dwellSeconds[static_cast<std::size_t>(region)] += sample.durationSeconds;
+
+        // Draw every fixation seen so far; current sample controls the radius scale for all
+        // circles so longer gazes appear larger.
+        const double radius = 12.0 + sample.durationSeconds * 55.0;  // Larger when staring longer.
+        for (std::size_t i = 0; i < pointsDrawn.size(); ++i) {
+            const auto r = regionIndexForPoint(pointsDrawn[i], width, height);
+            cv::circle(frame, pointsDrawn[i], static_cast<int>(radius), colorForAOI(r), -1, cv::LINE_AA);
         }
 
-        // Exponential decay so older gaze points slowly fade.
-        heatmap *= 0.97f;
+        const double totalObserved = dwellSeconds[0] + dwellSeconds[1] + dwellSeconds[2] + dwellSeconds[3];
+        const auto percentage = [&](int idx) {
+            if (totalObserved <= 0.0) return 0.0;
+            return dwellSeconds[static_cast<std::size_t>(idx)] / totalObserved * 100.0;
+        };
 
-        // Replace this demo with real gaze data (x, y in pixels) from your eye tracker.
-        auto gazePoints = generateDemoGazePoints(frame.cols, frame.rows);
-        drawGazePoints(heatmap, gazePoints);
+        // Overlay AOI percentages and durations so the viewer sees live dwell stats.
+        const int textYStart = height - 80;
+        const double fontScale = 0.75;
+        const int thickness = 2;
+        char buffer[128];
+        for (int i = 0; i < 4; ++i) {
+            std::snprintf(buffer, sizeof(buffer), "AOI%d: %5.1f%% (%.2fs)", i + 1, percentage(i),
+                          dwellSeconds[static_cast<std::size_t>(i)]);
+            cv::putText(frame, buffer, {20, textYStart + i * 20}, cv::FONT_HERSHEY_SIMPLEX, fontScale,
+                        colorForAOI(i), thickness, cv::LINE_AA);
+        }
 
-        cv::Mat overlay = renderHeatmapOverlay(frame, heatmap);
-        cv::putText(overlay, "Demo heatmap: replace random gaze points with tracker input", {20, 30},
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, {255, 255, 255}, 2, cv::LINE_AA);
-        cv::putText(overlay, "Press 'q' to exit", {20, 60}, cv::FONT_HERSHEY_SIMPLEX, 0.7, {255, 255, 255}, 2,
-                    cv::LINE_AA);
+        cv::putText(frame, "Press Esc or 'q' to quit early", {20, 40}, cv::FONT_HERSHEY_SIMPLEX,
+                    0.8, {255, 255, 255}, 2, cv::LINE_AA);
+        cv::putText(frame, "Synthetic gaze sequence (one circle per fixation)", {20, 70},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, {255, 255, 255}, 2, cv::LINE_AA);
 
-        cv::imshow("Gaze Heatmap Overlay", overlay);
-        const int key = cv::waitKey(1);
+        cv::imshow("AOI Gaze Demo", frame);
+        const int key = cv::waitKey(450);
         if (key == 'q' || key == 27) {
             break;
         }
     }
 
+    const double totalObserved = dwellSeconds[0] + dwellSeconds[1] + dwellSeconds[2] + dwellSeconds[3];
+    std::cout << "\nSummary (percentage of observed time in each AOI):\n";
+    for (int i = 0; i < 4; ++i) {
+        const double pct = totalObserved > 0.0 ? dwellSeconds[static_cast<std::size_t>(i)] / totalObserved * 100.0
+                                               : 0.0;
+        std::cout << "  AOI" << (i + 1) << ": " << pct << "% (" << dwellSeconds[static_cast<std::size_t>(i)]
+                  << "s)" << std::endl;
+    }
+
+    std::cout << "\nReplace the synthetic samples with real eye-tracker coordinates and durations";
+    std::cout << " to turn this into a live analysis demo.\n";
     return 0;
 }
